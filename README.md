@@ -8,7 +8,7 @@ A tiny native macOS app utility to clean file metadata with a simple drag and dr
 You need macOS 15.7+ and the Xcode command line tools:
 
 ```bash
-xcode-select --install   # once, if you don't have them
+xcode-select --install
 ```
 
 Then:
