@@ -1,8 +1,10 @@
 import Foundation
 
 /// Orchestrates cleaning: picks the right strategy for the file type,
-/// writes a `.cleaned` copy next to the original, and always strips
-/// macOS extended attributes. The original file is never modified.
+/// cleans into a temporary file, then overwrites the ORIGINAL file in place,
+/// and always strips macOS extended attributes.
+///
+/// WARNING: this version overwrites the original file. There is no undo.
 struct MetadataCleanerService {
 
     func clean(url: URL) async -> CleaningResult {
@@ -17,42 +19,56 @@ struct MetadataCleanerService {
         }
 
         let category = FileTypeDetector.category(for: url)
-        let dst = FileCopyHelper.makeCleanedURL(for: url)
 
-        // Run the type-specific deep cleaner, which writes directly to `dst`.
+        // Temp output next to the original (same volume → atomic replace works).
+        let tmp = url.deletingLastPathComponent()
+            .appendingPathComponent(".\(UUID().uuidString).\(url.pathExtension)")
+
+        // Run the type-specific deep cleaner, which writes to the temp file.
         let produced: Bool
         switch category {
-        case .image:  produced = ImageMetadataCleaner.clean(from: url, to: dst)
-        case .pdf:    produced = PDFMetadataCleaner.clean(from: url, to: dst)
-        case .office: produced = OfficeMetadataCleaner.clean(from: url, to: dst)
-        case .media:  produced = await MediaMetadataCleaner.clean(from: url, to: dst)
+        case .image:  produced = ImageMetadataCleaner.clean(from: url, to: tmp)
+        case .pdf:    produced = PDFMetadataCleaner.clean(from: url, to: tmp)
+        case .office: produced = OfficeMetadataCleaner.clean(from: url, to: tmp)
+        case .media:  produced = await MediaMetadataCleaner.clean(from: url, to: tmp)
         case .unknown: produced = false
         }
 
         if produced {
-            // Deep clean succeeded — also strip filesystem-level attributes.
-            ExtendedAttributesCleaner.clean(at: dst)
-            return CleaningResult(originalURL: url, cleanedURL: dst, status: .success)
-        }
-
-        // Fallback: copy the file untouched and strip macOS attributes only.
-        guard FileCopyHelper.copyItem(from: url, to: dst) else {
+            // Replace the original with the cleaned temp file.
+            if replaceOriginal(url, with: tmp) {
+                ExtendedAttributesCleaner.clean(at: url)
+                return CleaningResult(originalURL: url, cleanedURL: url, status: .success)
+            }
+            try? FileManager.default.removeItem(at: tmp)
             return CleaningResult(originalURL: url,
                                   cleanedURL: nil,
-                                  status: .failure("Could not clean this file type."))
+                                  status: .failure("Could not overwrite the original file."))
         }
-        ExtendedAttributesCleaner.clean(at: dst)
+
+        // No deep clean available — strip macOS attributes on the original in place.
+        try? FileManager.default.removeItem(at: tmp)
+        ExtendedAttributesCleaner.clean(at: url)
 
         switch category {
         case .unknown:
-            // Nothing more is expected for unknown types — this is a success.
-            return CleaningResult(originalURL: url, cleanedURL: dst, status: .success)
+            return CleaningResult(originalURL: url, cleanedURL: url, status: .success)
         default:
-            // A known type whose deep cleaning failed — partial result.
             return CleaningResult(
                 originalURL: url,
-                cleanedURL: dst,
+                cleanedURL: url,
                 status: .warning("Cleaned macOS attributes; embedded metadata couldn't be fully removed."))
+        }
+    }
+
+    /// Atomically swaps the original file for the cleaned temp file,
+    /// preserving the original's name and location.
+    private func replaceOriginal(_ original: URL, with tmp: URL) -> Bool {
+        do {
+            _ = try FileManager.default.replaceItemAt(original, withItemAt: tmp)
+            return true
+        } catch {
+            return false
         }
     }
 }
